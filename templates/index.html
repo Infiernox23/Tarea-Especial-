@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Teachable Machine + Arduino</title>
+<style>
+  :root {
+    --fondo: #eef3f1;
+    --panel: #ffffff;
+    --texto: #16302b;
+    --suave: #5b726c;
+    --linea: #cfdcd8;
+    --acento: #0b7a63;
+    --acento-osc: #075a49;
+    --alerta: #b3361f;
+    font-family: "Segoe UI", system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fondo: #101a18; --panel: #172421; --texto: #e3efec;
+      --suave: #93aaa4; --linea: #2b3f3a; --acento: #3fc3a4; --acento-osc: #2ea58a;
+      --alerta: #ff8a73;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--fondo); color: var(--texto); }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; }
+  .sub { color: var(--suave); margin: 0 0 20px; }
+  .rejilla { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .rejilla { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--linea); border-radius: 10px; padding: 16px; }
+  h2 { font-size: 1.05rem; margin: 0 0 12px; }
+  label { display: block; font-size: .9rem; color: var(--suave); margin: 10px 0 4px; }
+  input[type=text], select {
+    width: 100%; padding: 9px 10px; border-radius: 6px;
+    border: 1px solid var(--linea); background: var(--fondo); color: var(--texto); font: inherit;
+  }
+  input[type=range] { width: 100%; accent-color: var(--acento); }
+  button {
+    margin-top: 12px; padding: 9px 16px; border: 0; border-radius: 6px;
+    background: var(--acento); color: #fff; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:hover { background: var(--acento-osc); }
+  button.sec { background: transparent; color: var(--texto); border: 1px solid var(--linea); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  :focus-visible { outline: 3px solid var(--acento); outline-offset: 2px; }
+  .estado { font-size: .9rem; margin-top: 10px; min-height: 1.3em; color: var(--suave); }
+  .estado.ok { color: var(--acento); }
+  .estado.error { color: var(--alerta); }
+  #camara { display: flex; justify-content: center; min-height: 240px; background: var(--fondo); border-radius: 8px; }
+  #camara canvas { max-width: 100%; border-radius: 8px; }
+  .clase { margin: 10px 0; }
+  .clase .fila { display: flex; justify-content: space-between; font-size: .95rem; }
+  .barra { height: 12px; background: var(--fondo); border-radius: 6px; overflow: hidden; margin-top: 4px; }
+  .barra > div { height: 100%; width: 0; background: var(--linea); transition: width .12s; }
+  .clase.activa .barra > div { background: var(--acento); }
+  .clase.activa .fila { font-weight: 700; }
+  .gran { font-size: 1.5rem; font-weight: 700; margin: 4px 0 2px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Teachable Machine + Arduino</h1>
+  <p class="sub">El modelo reconoce la cámara y manda la clase detectada al Arduino por USB.</p>
+
+  <div class="rejilla">
+    <div>
+      <section>
+        <h2>1. Conectar el Arduino</h2>
+        <label for="puerto">Puerto USB</label>
+        <select id="puerto"></select>
+        <button id="btnConectar">Conectar</button>
+        <button id="btnActualizar" class="sec">Actualizar lista</button>
+        <div id="estadoArduino" class="estado">Sin conexión.</div>
+      </section>
+
+      <section style="margin-top:16px">
+        <h2>2. Cargar el modelo</h2>
+        <label for="urlModelo">Enlace del modelo de Teachable Machine</label>
+        <input type="text" id="urlModelo" placeholder="https://teachablemachine.withgoogle.com/models/XXXX/">
+        <label for="umbral">Confianza mínima: <span id="umbralTxt">90</span>%</label>
+        <input type="range" id="umbral" min="50" max="99" value="90">
+        <button id="btnModelo">Cargar y empezar</button>
+        <div id="estadoModelo" class="estado"></div>
+      </section>
+    </div>
+
+    <section>
+      <h2>3. Resultado</h2>
+      <div id="camara"></div>
+      <div class="gran" id="deteccion">—</div>
+      <div class="estado" id="envio">Esperando modelo.</div>
+      <div id="clases"></div>
+    </section>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
+<script>
+  let modelo = null, camara = null, corriendo = false;
+  let arduinoListo = false, ultimoEnviado = -1;
+
+  const $ = id => document.getElementById(id);
+
+  function mensaje(el, texto, tipo = "") {
+    el.textContent = texto;
+    el.className = "estado " + tipo;
+  }
+
+  async function cargarPuertos() {
+    const r = await fetch("/api/puertos");
+    const lista = await r.json();
+    $("puerto").innerHTML = lista.length
+      ? lista.map(p => `<option value="${p.puerto}">${p.puerto} — ${p.descripcion}</option>`).join("")
+      : `<option value="">No se encontró ningún puerto</option>`;
+  }
+
+  $("btnActualizar").onclick = cargarPuertos;
+
+  $("btnConectar").onclick = async () => {
+    const puerto = $("puerto").value;
+    mensaje($("estadoArduino"), "Conectando…");
+    const r = await fetch("/api/conectar", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ puerto })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      arduinoListo = true;
+      ultimoEnviado = -1;
+      mensaje($("estadoArduino"), "Conectado a " + puerto, "ok");
+    } else {
+      arduinoListo = false;
+      mensaje($("estadoArduino"), d.error, "error");
+    }
+  };
+
+  $("umbral").oninput = e => $("umbralTxt").textContent = e.target.value;
+
+  $("btnModelo").onclick = async () => {
+    let url = $("urlModelo").value.trim();
+    if (!url) { mensaje($("estadoModelo"), "Pega el enlace del modelo.", "error"); return; }
+    if (!url.endsWith("/")) url += "/";
+    mensaje($("estadoModelo"), "Cargando modelo…");
+    try {
+      corriendo = false;
+      modelo = await tmImage.load(url + "model.json", url + "metadata.json");
+      if (camara) camara.stop();
+      camara = new tmImage.Webcam(300, 300, true);
+      await camara.setup();
+      await camara.play();
+      $("camara").innerHTML = "";
+      $("camara").appendChild(camara.canvas);
+
+      $("clases").innerHTML = modelo.getClassLabels().map((n, i) => `
+        <div class="clase" id="clase${i}">
+          <div class="fila"><span>${n} (letra ${String.fromCharCode(65 + i)})</span><span id="pct${i}">0%</span></div>
+          <div class="barra"><div id="bar${i}"></div></div>
+        </div>`).join("");
+
+      mensaje($("estadoModelo"), "Modelo listo con " + modelo.getTotalClasses() + " clases.", "ok");
+      corriendo = true;
+      requestAnimationFrame(ciclo);
+    } catch (e) {
+      mensaje($("estadoModelo"), "No se pudo cargar el modelo o la cámara: " + e.message, "error");
+    }
+  };
+
+  async function ciclo() {
+    if (!corriendo) return;
+    camara.update();
+    const pred = await modelo.predict(camara.canvas);
+
+    let mejor = 0;
+    pred.forEach((p, i) => {
+      $("pct" + i).textContent = Math.round(p.probability * 100) + "%";
+      $("bar" + i).style.width = (p.probability * 100) + "%";
+      if (p.probability > pred[mejor].probability) mejor = i;
+    });
+    pred.forEach((_, i) => $("clase" + i).classList.toggle("activa", i === mejor));
+
+    const umbral = Number($("umbral").value) / 100;
+    if (pred[mejor].probability >= umbral) {
+      $("deteccion").textContent = pred[mejor].className;
+      if (mejor !== ultimoEnviado) await enviar(mejor, pred[mejor].className);
+    } else {
+      $("deteccion").textContent = "Sin certeza";
+    }
+    requestAnimationFrame(ciclo);
+  }
+
+  async function enviar(indice, nombre) {
+    if (!arduinoListo) { mensaje($("envio"), "Detectado, pero el Arduino no está conectado.", "error"); return; }
+    try {
+      const r = await fetch("/api/clase", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ indice, nombre })
+      });
+      const d = await r.json();
+      if (d.ok) {
+        ultimoEnviado = indice;
+        mensaje($("envio"), `Enviada la letra ${d.letra} al Arduino.`, "ok");
+      } else {
+        mensaje($("envio"), d.error, "error");
+      }
+    } catch (e) {
+      mensaje($("envio"), "No hay respuesta del servidor Python.", "error");
+    }
+  }
+
+  cargarPuertos();
+</script>
+</body>
+</html>
